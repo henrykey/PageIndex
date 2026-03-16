@@ -710,3 +710,159 @@ class ConfigLoader:
         self._validate_keys(user_dict)
         merged = {**self._default_dict, **user_dict}
         return config(**merged)
+# Runtime LLM injection support (aligned with MCP router dynamic provider binding)
+from contextvars import ContextVar
+from typing import Any, Dict, Optional
+
+_RUNTIME_LLM_CONFIG: ContextVar[Dict[str, Any]] = ContextVar("_runtime_llm_config", default={})
+
+
+def set_runtime_llm_config(cfg: Optional[Dict[str, Any]]):
+    """Set per-request runtime LLM config and return context token for reset."""
+    effective = dict(cfg or {})
+    return _RUNTIME_LLM_CONFIG.set(effective)
+
+
+def clear_runtime_llm_config(token=None):
+    """Clear per-request runtime LLM config."""
+    if token is None:
+        _RUNTIME_LLM_CONFIG.set({})
+    else:
+        _RUNTIME_LLM_CONFIG.reset(token)
+
+
+def get_runtime_llm_config() -> Dict[str, Any]:
+    return dict(_RUNTIME_LLM_CONFIG.get() or {})
+
+
+def _build_openai_client_kwargs(api_key: Optional[str] = None) -> Dict[str, Any]:
+    cfg = get_runtime_llm_config()
+    kwargs: Dict[str, Any] = {}
+
+    resolved_api_key = str(cfg.get("api_key") or api_key or CHATGPT_API_KEY or "").strip()
+    if resolved_api_key:
+        kwargs["api_key"] = resolved_api_key
+
+    base_url = str(cfg.get("base_url") or "").strip()
+    if base_url:
+        kwargs["base_url"] = base_url
+
+    timeout_sec = cfg.get("timeout_sec")
+    if timeout_sec is not None:
+        try:
+            kwargs["timeout"] = max(1, int(timeout_sec))
+        except Exception:
+            pass
+
+    max_retries = cfg.get("max_retries")
+    if max_retries is not None:
+        try:
+            kwargs["max_retries"] = max(0, int(max_retries))
+        except Exception:
+            pass
+
+    return kwargs
+
+
+def _build_completion_kwargs() -> Dict[str, Any]:
+    cfg = get_runtime_llm_config()
+    kwargs: Dict[str, Any] = {"temperature": 0}
+
+    if cfg.get("temperature") is not None:
+        try:
+            kwargs["temperature"] = float(cfg.get("temperature"))
+        except Exception:
+            pass
+
+    if cfg.get("max_tokens") is not None:
+        try:
+            kwargs["max_tokens"] = max(64, int(cfg.get("max_tokens")))
+        except Exception:
+            pass
+
+    return kwargs
+
+
+def ChatGPT_API_with_finish_reason(model, prompt, api_key=CHATGPT_API_KEY, chat_history=None):
+    max_retries = 10
+    client = openai.OpenAI(**_build_openai_client_kwargs(api_key=api_key))
+    completion_kwargs = _build_completion_kwargs()
+
+    for i in range(max_retries):
+        try:
+            if chat_history:
+                messages = list(chat_history)
+                messages.append({"role": "user", "content": prompt})
+            else:
+                messages = [{"role": "user", "content": prompt}]
+
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                **completion_kwargs,
+            )
+            if response.choices[0].finish_reason == "length":
+                return response.choices[0].message.content, "max_output_reached"
+            return response.choices[0].message.content, "finished"
+        except Exception as e:
+            print('************* Retrying *************')
+            logging.error(f"Error: {e}")
+            if i < max_retries - 1:
+                time.sleep(1)
+            else:
+                logging.error('Max retries reached for prompt: ' + prompt)
+                return "Error"
+
+
+def ChatGPT_API(model, prompt, api_key=CHATGPT_API_KEY, chat_history=None):
+    max_retries = 10
+    client = openai.OpenAI(**_build_openai_client_kwargs(api_key=api_key))
+    completion_kwargs = _build_completion_kwargs()
+
+    for i in range(max_retries):
+        try:
+            if chat_history:
+                messages = list(chat_history)
+                messages.append({"role": "user", "content": prompt})
+            else:
+                messages = [{"role": "user", "content": prompt}]
+
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                **completion_kwargs,
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            print('************* Retrying *************')
+            logging.error(f"Error: {e}")
+            if i < max_retries - 1:
+                time.sleep(1)
+            else:
+                logging.error('Max retries reached for prompt: ' + prompt)
+                return "Error"
+
+
+async def ChatGPT_API_async(model, prompt, api_key=CHATGPT_API_KEY):
+    max_retries = 10
+    messages = [{"role": "user", "content": prompt}]
+    client_kwargs = _build_openai_client_kwargs(api_key=api_key)
+    completion_kwargs = _build_completion_kwargs()
+
+    for i in range(max_retries):
+        try:
+            async with openai.AsyncOpenAI(**client_kwargs) as client:
+                response = await client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    **completion_kwargs,
+                )
+                return response.choices[0].message.content
+        except Exception as e:
+            print('************* Retrying *************')
+            logging.error(f"Error: {e}")
+            if i < max_retries - 1:
+                await asyncio.sleep(1)
+            else:
+                logging.error('Max retries reached for prompt: ' + prompt)
+                return "Error"
